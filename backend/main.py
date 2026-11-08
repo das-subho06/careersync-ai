@@ -5,12 +5,12 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from database import get_connection, get_db_cursor
-from auth import router as auth_router
+from auth import router as auth_router, get_current_user
 
 # =========================================================
 # APPLICATION SETUP
@@ -37,6 +37,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+        "http://localhost:19006",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -114,7 +117,10 @@ class StudentFeatures(BaseModel):
 
 def db_error(exc):
     """Return a generic database error without leaking credentials."""
-    print("Database error:", repr(exc))
+    import traceback
+
+    print("Database error:", str(exc))
+    traceback.print_exc()
     raise HTTPException(
         status_code=500,
         detail="A database operation failed. Check the backend terminal.",
@@ -135,6 +141,63 @@ def normalize_yes_no(value, field_name):
 
     return normalized.title()
 
+class StudentProfileUpdate(BaseModel):
+    cgpa: float | None = Field(default=None, ge=0, le=10)
+    ssc_marks: float | None = Field(default=None, ge=0, le=100)
+    hsc_marks: float | None = Field(default=None, ge=0, le=100)
+    internships: int | None = Field(default=None, ge=0)
+    projects: int | None = Field(default=None, ge=0)
+    workshops_certifications: int | None = Field(default=None, ge=0)
+    aptitude_test_score: float | None = Field(default=None, ge=0, le=100)
+    soft_skills_rating: float | None = Field(default=None, ge=0, le=5)
+    extracurricular_activities: str | None = None
+    placement_training: str | None = None
+
+
+class StudentSkillSet(BaseModel):
+    skill_name: str = Field(min_length=1, max_length=80)
+    level: int = Field(default=3, ge=1, le=5)
+
+
+class JobSkillSet(BaseModel):
+    skill_name: str = Field(min_length=1, max_length=80)
+    required_level: int = Field(default=3, ge=1, le=5)
+    importance: int = Field(default=50, ge=1, le=100)
+
+
+def get_or_create_skill_id(cursor, skill_name):
+    name = skill_name.strip()
+    cursor.execute(
+        "SELECT SKILL_ID FROM CS_SKILLS WHERE LOWER(SKILL_NAME) = LOWER(:name)",
+        {"name": name},
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+
+    new_id = cursor.var(int)
+    cursor.execute(
+        """
+        INSERT INTO CS_SKILLS (SKILL_NAME) VALUES (:name)
+        RETURNING SKILL_ID INTO :new_id
+        """,
+        {"name": name, "new_id": new_id},
+    )
+    return new_id.getvalue()[0]
+
+
+def current_student_id(cursor, user):
+    if user["role"] != "STUDENT":
+        raise HTTPException(status_code=403, detail="Students only.")
+
+    cursor.execute(
+        "SELECT STUDENT_ID FROM CS_STUDENTS WHERE USER_ID = :owner_id",
+        {"owner_id": user["user_id"]},
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Student profile not found.")
+    return row[0]
 
 def predict_features(student: StudentFeatures):
     row = pd.DataFrame([{
@@ -285,6 +348,205 @@ def list_students(limit: int = Query(default=50, ge=1, le=200)):
     except Exception as exc:
         db_error(exc)
 
+@app.get("/api/students/me")
+def get_my_student(user=Depends(get_current_user)):
+    try:
+        with get_db_cursor() as cursor:
+            student_id = current_student_id(cursor, user)
+            cursor.execute(
+                """
+                SELECT STUDENT_ID, FULL_NAME, EMAIL, BRANCH, GRADUATION_YEAR,
+                       CGPA, SSC_MARKS, HSC_MARKS, INTERNSHIPS, PROJECTS,
+                       WORKSHOPS_CERTIFICATIONS, APTITUDE_TEST_SCORE,
+                       SOFT_SKILLS_RATING, EXTRACURRICULAR_ACTIVITIES,
+                       PLACEMENT_TRAINING
+                FROM CS_STUDENTS WHERE STUDENT_ID = :id
+                """,
+                {"id": student_id},
+            )
+            columns = [col[0].lower() for col in cursor.description]
+            return dict(zip(columns, cursor.fetchone()))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db_error(exc)
+
+@app.get("/api/students/me/skills")
+def get_my_skills(user=Depends(get_current_user)):
+    try:
+        with get_db_cursor() as cursor:
+            student_id = current_student_id(cursor, user)
+            cursor.execute(
+                """
+                SELECT S.SKILL_ID, S.SKILL_NAME, SS.PROFICIENCY
+                FROM CS_STUDENT_SKILLS SS
+                JOIN CS_SKILLS S ON S.SKILL_ID = SS.SKILL_ID
+                WHERE SS.STUDENT_ID = :sid
+                ORDER BY S.SKILL_NAME ASC
+                """,
+                {"sid": student_id},
+            )
+            columns = [col[0].lower() for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db_error(exc)
+
+@app.patch("/api/students/me/profile")
+def update_my_profile(
+    update: StudentProfileUpdate,
+    user=Depends(get_current_user),
+):
+    data = update.model_dump(exclude_unset=True)
+
+    if "extracurricular_activities" in data:
+        data["extracurricular_activities"] = normalize_yes_no(
+            data["extracurricular_activities"], "extracurricular_activities"
+        )
+    if "placement_training" in data:
+        data["placement_training"] = normalize_yes_no(
+            data["placement_training"], "placement_training"
+        )
+
+    if not data:
+        raise HTTPException(status_code=422, detail="No fields to update.")
+
+    # Column names come from the model's own field names, never from user text.
+    assignments = ", ".join(f"{name.upper()} = :{name}" for name in data)
+
+    try:
+        with get_db_cursor() as cursor:
+            student_id = current_student_id(cursor, user)
+            cursor.execute(
+                f"UPDATE CS_STUDENTS SET {assignments} WHERE STUDENT_ID = :sid",
+                {**data, "sid": student_id},
+            )
+        return {"message": "Profile updated", "updated_fields": list(data)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db_error(exc)
+
+
+@app.post("/api/students/me/skills")
+def set_my_skill(skill: StudentSkillSet, user=Depends(get_current_user)):
+    try:
+        with get_db_cursor() as cursor:
+            student_id = current_student_id(cursor, user)
+            skill_id = get_or_create_skill_id(cursor, skill.skill_name)
+            cursor.execute(
+                """
+                MERGE INTO CS_STUDENT_SKILLS t
+                USING (SELECT :sid AS STUDENT_ID, :skid AS SKILL_ID FROM DUAL) s
+                ON (t.STUDENT_ID = s.STUDENT_ID AND t.SKILL_ID = s.SKILL_ID)
+                WHEN MATCHED THEN UPDATE SET t.PROFICIENCY = :lvl
+                WHEN NOT MATCHED THEN INSERT (STUDENT_ID, SKILL_ID, PROFICIENCY)
+                    VALUES (s.STUDENT_ID, s.SKILL_ID, :lvl)
+                """,
+                {"sid": student_id, "skid": skill_id, "lvl": skill.level},
+            )
+        return {"message": "Skill saved", "skill_id": skill_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db_error(exc)
+
+
+@app.post("/api/students/me/predict")
+def predict_my_placement(user=Depends(get_current_user)):
+    """Reads the stored profile from Oracle, runs the model, saves the result."""
+    try:
+        with get_db_cursor() as cursor:
+            student_id = current_student_id(cursor, user)
+            cursor.execute(
+                """
+                SELECT CGPA, INTERNSHIPS, PROJECTS, WORKSHOPS_CERTIFICATIONS,
+                       SSC_MARKS, HSC_MARKS, EXTRACURRICULAR_ACTIVITIES,
+                       PLACEMENT_TRAINING
+                FROM CS_STUDENTS WHERE STUDENT_ID = :id
+                """,
+                {"id": student_id},
+            )
+            row = cursor.fetchone()
+
+            if any(value is None for value in row):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Complete your profile first: PATCH /api/students/me/profile",
+                )
+
+            features = StudentFeatures(
+                cgpa=float(row[0]),
+                internships=int(row[1]),
+                projects=int(row[2]),
+                workshops_certifications=int(row[3]),
+                ssc_marks=float(row[4]),
+                hsc_marks=float(row[5]),
+                extracurricular_activities=row[6],
+                placement_training=row[7],
+            )
+            result = predict_features(features)
+
+            prediction_id = cursor.var(int)
+            cursor.execute(
+                """
+                INSERT INTO CS_PREDICTIONS (
+                    STUDENT_ID, PLACEMENT_PROBABILITY, MODEL_VERSION
+                )
+                VALUES (:student_id, :probability, :version)
+                RETURNING PREDICTION_ID INTO :prediction_id
+                """,
+                {
+                    "student_id": student_id,
+                    "probability": result["model_score"],
+                    "version": result["model_version"],
+                    "prediction_id": prediction_id,
+                },
+            )
+
+            return {
+                "prediction_id": prediction_id.getvalue()[0],
+                "student_id": student_id,
+                **result,
+                "saved": True,
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db_error(exc)
+
+
+@app.post("/api/jobs/{job_id}/skills", status_code=201)
+def set_job_skill(job_id: int, skill: JobSkillSet):
+    try:
+        with get_db_cursor() as cursor:
+            cursor.execute("SELECT 1 FROM CS_JOBS WHERE JOB_ID = :id", {"id": job_id})
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+
+            skill_id = get_or_create_skill_id(cursor, skill.skill_name)
+            cursor.execute(
+                """
+                MERGE INTO CS_JOB_SKILLS t
+                USING (SELECT :jid AS JOB_ID, :skid AS SKILL_ID FROM DUAL) s
+                ON (t.JOB_ID = s.JOB_ID AND t.SKILL_ID = s.SKILL_ID)
+                WHEN MATCHED THEN UPDATE
+                    SET t.REQUIRED_LEVEL = :lvl, t.IMPORTANCE = :imp
+                WHEN NOT MATCHED THEN INSERT
+                    (JOB_ID, SKILL_ID, REQUIRED_LEVEL, IMPORTANCE)
+                    VALUES (s.JOB_ID, s.SKILL_ID, :lvl, :imp)
+                """,
+                {
+                    "jid": job_id, "skid": skill_id,
+                    "lvl": skill.required_level, "imp": skill.importance,
+                },
+            )
+        return {"message": "Job skill saved", "skill_id": skill_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db_error(exc)
 
 @app.get("/api/students/{student_id}")
 def get_student(student_id: int):
@@ -375,7 +637,28 @@ def list_companies():
     except Exception as exc:
         db_error(exc)
 
-
+@app.get("/api/companies/me")
+def get_my_company(user=Depends(get_current_user)):
+    if user["role"] != "RECRUITER":
+        raise HTTPException(status_code=403, detail="Recruiters only.")
+    try:
+        with get_db_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COMPANY_ID, USER_ID, COMPANY_NAME, EMAIL, INDUSTRY, LOCATION
+                FROM CS_COMPANIES WHERE USER_ID = :user_id_val
+                """,
+                {"user_id_val": user["user_id"]},
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Company profile not found.")
+            columns = [col[0].lower() for col in cursor.description]
+            return dict(zip(columns, row))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db_error(exc)
 # =========================================================
 # JOBS
 # =========================================================
@@ -422,7 +705,6 @@ def create_job(job: JobCreate):
             raise HTTPException(status_code=404, detail="Company not found")
         db_error(exc)
 
-
 @app.get("/api/jobs")
 def list_jobs(
     status: str = Query(default="OPEN", pattern="^(OPEN|CLOSED|DRAFT|ALL)$"),
@@ -436,7 +718,14 @@ def list_jobs(
                        J.JOB_TITLE, J.JOB_DESCRIPTION, J.JOB_TYPE,
                        J.MIN_CGPA, J.MAX_BACKLOGS, J.SALARY_LPA,
                        J.LOCATION, J.GRADUATION_YEAR, J.DEADLINE,
-                       J.JOB_STATUS, J.POSTED_AT
+                       J.JOB_STATUS, J.POSTED_AT,
+                       (
+                           SELECT LISTAGG(S.SKILL_NAME || ' (L' || JS.REQUIRED_LEVEL || ')', ', ')
+                           WITHIN GROUP (ORDER BY S.SKILL_NAME)
+                           FROM CS_JOB_SKILLS JS
+                           JOIN CS_SKILLS S ON S.SKILL_ID = JS.SKILL_ID
+                           WHERE JS.JOB_ID = J.JOB_ID
+                       ) AS SKILLS
                 FROM CS_JOBS J
                 JOIN CS_COMPANIES C ON C.COMPANY_ID = J.COMPANY_ID
                 WHERE (:status = 'ALL' OR J.JOB_STATUS = :status)
@@ -739,6 +1028,9 @@ def predict_and_save(student_id: int, student: StudentFeatures):
             if cursor.fetchone() is None:
                 raise HTTPException(status_code=404, detail="Student not found")
 
+             
+            prediction_id = cursor.var(int)
+
             cursor.execute(
                 """
                 INSERT INTO CS_PREDICTIONS (
@@ -751,19 +1043,20 @@ def predict_and_save(student_id: int, student: StudentFeatures):
                     "student_id": student_id,
                     "probability": result["model_score"],
                     "version": result["model_version"],
-                    "prediction_id": cursor.var(int),
+                    "prediction_id": prediction_id,
                 },
             )
 
-            prediction_id = cursor.getimplicitresults() if False else None
+            
             # Fetch the generated ID through an explicit bind variable
             # in the corrected version below.
 
             return {
+                "prediction_id": prediction_id.getvalue()[0],
                 "student_id": student_id,
                 **result,
                 "saved": True,
-                "notice": (
+                 "notice": (
                     "Experimental model estimate; not a validated "
                     "real-world placement probability."
                 ),

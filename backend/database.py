@@ -8,6 +8,7 @@ import importlib
 # Load the driver dynamically so static analyzers do not require it to be
 # installed in the editor's currently selected environment.
 oracledb = importlib.import_module("oracledb")
+oracledb.defaults.fetch_lobs = False
 from dotenv import load_dotenv
 
 load_dotenv()

@@ -1,4 +1,3 @@
-
 import hashlib
 import secrets
 
@@ -9,7 +8,6 @@ from pwdlib import PasswordHash
 
 from database import get_db_cursor
 
-
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 password_hasher = PasswordHash.recommended()
@@ -18,7 +16,7 @@ bearer_scheme = HTTPBearer(auto_error=False)
 SESSION_HOURS = 12
 
 
-# ---------- Request models ----------
+# ---------- Request & Response Models ----------
 
 class StudentRegister(BaseModel):
     full_name: str = Field(min_length=2, max_length=150)
@@ -59,7 +57,6 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_session(cursor, user_id: int) -> str:
-    # The raw token is returned only to the client.
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
 
@@ -84,9 +81,7 @@ def create_session(cursor, user_id: int) -> str:
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(
-        bearer_scheme
-    ),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ):
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
@@ -95,9 +90,7 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token_hash = hashlib.sha256(
-        credentials.credentials.encode()
-    ).hexdigest()
+    token_hash = hashlib.sha256(credentials.credentials.encode()).hexdigest()
 
     with get_db_cursor() as cursor:
         cursor.execute(
@@ -141,7 +134,7 @@ def require_role(*allowed_roles: str):
     return role_dependency
 
 
-# ---------- Student registration ----------
+# ---------- Student Registration ----------
 
 @router.post("/register/student", status_code=201)
 def register_student(payload: StudentRegister):
@@ -161,8 +154,7 @@ def register_student(payload: StudentRegister):
         cursor.execute(
             """
             INSERT INTO CS_USERS
-                (EMAIL, PASSWORD_HASH, ROLE, ACCOUNT_STATUS,
-                 EMAIL_VERIFIED)
+                (EMAIL, PASSWORD_HASH, ROLE, ACCOUNT_STATUS, EMAIL_VERIFIED)
             VALUES
                 (:email, :password_hash, 'STUDENT', 'ACTIVE', 0)
             RETURNING USER_ID INTO :user_id
@@ -200,7 +192,7 @@ def register_student(payload: StudentRegister):
     }
 
 
-# ---------- Recruiter registration ----------
+# ---------- Recruiter Registration ----------
 
 @router.post("/register/recruiter", status_code=201)
 def register_recruiter(payload: RecruiterRegister):
@@ -220,8 +212,7 @@ def register_recruiter(payload: RecruiterRegister):
         cursor.execute(
             """
             INSERT INTO CS_USERS
-                (EMAIL, PASSWORD_HASH, ROLE, ACCOUNT_STATUS,
-                 EMAIL_VERIFIED)
+                (EMAIL, PASSWORD_HASH, ROLE, ACCOUNT_STATUS, EMAIL_VERIFIED)
             VALUES
                 (:email, :password_hash, 'RECRUITER', 'ACTIVE', 0)
             RETURNING USER_ID INTO :user_id
@@ -259,7 +250,7 @@ def register_recruiter(payload: RecruiterRegister):
     }
 
 
-# ---------- Login ----------
+# ---------- Login (Matches /api/auth/login) ----------
 
 @router.post("/login")
 def login(payload: LoginRequest):
@@ -276,7 +267,6 @@ def login(payload: LoginRequest):
         )
         row = cursor.fetchone()
 
-        # Use the same error for an unknown email and a wrong password.
         if row is None or not verify_password(payload.password, row[2]):
             raise HTTPException(
                 status_code=401,
@@ -290,21 +280,58 @@ def login(payload: LoginRequest):
                 detail="This account is not active",
             )
 
-        token = create_session(cursor, int(row[0]))
+        user_id, user_email, _, role, _ = row
+
+        # 1. Recruiter Validation: Must have an existing company row
+        if role == "RECRUITER":
+            cursor.execute(
+                """
+                SELECT COMPANY_ID, COMPANY_NAME FROM CS_COMPANIES 
+                WHERE USER_ID = :user_id_val OR LOWER(EMAIL) = LOWER(:email_val)
+                """,
+                {"user_id_val": user_id, "email_val": user_email},
+            )
+            company_row = cursor.fetchone()
+            if company_row is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Company must register first before logging in.",
+                )
+            cursor.execute(
+                "UPDATE CS_COMPANIES SET USER_ID = :user_id_val WHERE COMPANY_ID = :cid AND USER_ID IS NULL",
+                {"user_id_val": user_id, "cid": company_row[0]},
+            )
+
+        # 2. Student Validation: Must have an existing student profile
+        if role == "STUDENT":
+            cursor.execute(
+                """
+                SELECT STUDENT_ID FROM CS_STUDENTS 
+                WHERE USER_ID = :user_id_val OR LOWER(EMAIL) = LOWER(:email_val)
+                """,
+                {"user_id_val": user_id, "email_val": user_email},
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Student must register first before logging in.",
+                )
+
+        token = create_session(cursor, int(user_id))
 
     return {
         "access_token": token,
         "token_type": "bearer",
         "expires_in": SESSION_HOURS * 60 * 60,
         "user": {
-            "user_id": row[0],
-            "email": row[1],
-            "role": row[3],
+            "user_id": user_id,
+            "email": user_email,
+            "role": role,
         },
     }
 
 
-# ---------- Current logged-in user ----------
+# ---------- Current Logged-in User ----------
 
 @router.get("/me")
 def read_current_user(user=Depends(get_current_user)):
@@ -315,16 +342,12 @@ def read_current_user(user=Depends(get_current_user)):
 
 @router.post("/logout")
 def logout(
-    credentials: HTTPAuthorizationCredentials | None = Depends(
-        bearer_scheme
-    ),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ):
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    token_hash = hashlib.sha256(
-        credentials.credentials.encode()
-    ).hexdigest()
+    token_hash = hashlib.sha256(credentials.credentials.encode()).hexdigest()
 
     with get_db_cursor() as cursor:
         cursor.execute(
