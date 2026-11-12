@@ -521,7 +521,7 @@ const fetchRecruiterData = async () => {
       <View style={styles.header}>
         <View style={styles.brandRow}>
           <View style={styles.logoBadge}>
-            <Text style={styles.logoLetter}>J</Text>
+            <Text style={styles.logoLetter}>C</Text>
           </View>
           <Text style={styles.logoText}>CareerSync</Text>
         </View>
